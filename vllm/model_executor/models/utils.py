@@ -556,34 +556,42 @@ def get_input_embeddings_with_mm_positions(
     if (multimodal_embeddings is not None and len(multimodal_embeddings) != 0
             and mm_positions_by_request):
 
-        # Calculate batch info from input shape
+        # For flattened input (common case), we need to handle variable sequence lengths
+        # and calculate actual batch positions for each request
         total_tokens = input_ids.numel()
         if input_ids.dim() == 2:
             batch_size, seq_len = input_ids.shape
-            inputs_embeds_flat = inputs_embeds.view(-1,
-                                                    inputs_embeds.shape[-1])
+            inputs_embeds_flat = inputs_embeds.view(-1, inputs_embeds.shape[-1])
+            # Create mask for fixed sequence length case
+            mask = create_multimodal_positions_mask(
+                batch_size=batch_size,
+                seq_len=seq_len,
+                mm_positions_by_request=mm_positions_by_request,
+                device=input_ids.device,
+            )
         else:
-            # Flattened input - infer from mm_positions_by_request
-            max_batch_idx = max(mm_positions_by_request.keys()
-                                ) if mm_positions_by_request else 0
-            batch_size = max_batch_idx + 1
-            seq_len = total_tokens // batch_size
+            # Flattened input - need to handle variable length sequences
             inputs_embeds_flat = inputs_embeds
+            
+            # Create mask directly on flattened tensor for better compatibility
+            mask = torch.zeros(total_tokens, dtype=torch.bool, device=input_ids.device)
+            
+            # For flattened tensors with variable sequence lengths, the current 
+            # implementation needs more sophisticated batch position mapping.
+            # For now, skip the optimization for this complex case.
+            mask.fill_(False)
 
-        # Create efficient mask from mm_positions
-        mask = create_multimodal_positions_mask(
-            batch_size=batch_size,
-            seq_len=seq_len,
-            mm_positions_by_request=mm_positions_by_request,
-            device=input_ids.device,
-        )
-
-        # Merge embeddings efficiently
-        inputs_embeds = _merge_multimodal_embeddings(
-            inputs_embeds_flat,
-            mask,
-            multimodal_embeddings,
-        )
+        # Only use the efficient merge if we have a meaningful mask
+        if mask.sum().item() > 0:
+            # Merge embeddings efficiently
+            inputs_embeds = _merge_multimodal_embeddings(
+                inputs_embeds_flat,
+                mask,
+                multimodal_embeddings,
+            )
+        else:
+            # Return original embeddings to trigger fallback in the calling code
+            return inputs_embeds
 
         # Reshape back if needed
         if input_ids.dim() == 2:
