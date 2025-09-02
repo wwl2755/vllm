@@ -16,6 +16,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.multimodal import MultiModalPlaceholderMap, NestedTensors
+from vllm.multimodal.inputs import PlaceholderRange
 from vllm.sequence import IntermediateTensors
 from vllm.utils import (get_cuda_view_from_cpu_tensor, is_pin_memory_available,
                         is_uva_available)
@@ -475,6 +476,122 @@ def embed_multimodal(
     )
 
 
+def create_multimodal_positions_mask(
+    batch_size: int,
+    seq_len: int,
+    mm_positions_by_request: dict[int, list[PlaceholderRange]],
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Create a batch-level boolean mask for multimodal positions 
+    from mm_positions.
+    
+    This provides an efficient alternative to scanning input_ids 
+    for placeholder tokens by using the position information 
+    already available in scheduled requests.
+    
+    Args:
+        batch_size: Size of the batch
+        seq_len: Sequence length  
+        mm_positions_by_request: Dict mapping batch_index 
+        to list of PlaceholderRange
+        device: Device to create the mask on
+        
+    Returns:
+        Boolean tensor of shape (batch_size * seq_len,) 
+        indicating multimodal positions
+        
+    Example:
+        >>> # Instead of: mask = input_ids == placeholder_token_id
+        >>> mm_positions = {0: [PlaceholderRange(offset=5, length=10)]}
+        >>> mask = create_multimodal_positions_mask(1, 20, mm_positions, device)
+        >>> _merge_multimodal_embeddings(inputs_embeds, mask, multimodal_embeddings)
+    """
+    mask = torch.zeros(batch_size * seq_len, dtype=torch.bool, device=device)
+
+    for batch_idx, mm_positions in mm_positions_by_request.items():
+        for placeholder_range in mm_positions:
+            start_idx = batch_idx * seq_len + placeholder_range.offset
+            end_idx = start_idx + placeholder_range.length
+            mask[start_idx:end_idx] = True
+
+    return mask
+
+
+def get_input_embeddings_with_mm_positions(
+    input_ids: torch.Tensor,
+    get_text_embeds: Callable[[torch.Tensor], torch.Tensor],
+    multimodal_embeddings: Optional[NestedTensors] = None,
+    mm_positions_by_request: Optional[dict[int,
+                                           list[PlaceholderRange]]] = None,
+) -> torch.Tensor:
+    """
+    Utility function for efficient embedding merge using 
+    precomputed mm_positions.
+    
+    This can be used by any multimodal model instead of 
+    implementing the logic in each model's 
+    get_input_embeddings method.
+    
+    Args:
+        input_ids: Input token IDs
+        get_text_embeds: Function to get text embeddings from input_ids
+        multimodal_embeddings: Multimodal embeddings to merge
+        mm_positions_by_request: Dict mapping batch_index to list of PlaceholderRange
+        
+    Returns:
+        Merged embeddings tensor
+        
+    Example:
+        >>> # In a model's get_input_embeddings method:
+        >>> return get_input_embeddings_with_mm_positions(
+        ...     input_ids=input_ids,
+        ...     get_text_embeds=self.language_model.get_input_embeddings,
+        ...     multimodal_embeddings=multimodal_embeddings,
+        ...     mm_positions_by_request=mm_positions_by_request,
+        ... )
+    """
+    inputs_embeds = get_text_embeds(input_ids)
+
+    if (multimodal_embeddings is not None and len(multimodal_embeddings) != 0
+            and mm_positions_by_request):
+
+        # Calculate batch info from input shape
+        total_tokens = input_ids.numel()
+        if input_ids.dim() == 2:
+            batch_size, seq_len = input_ids.shape
+            inputs_embeds_flat = inputs_embeds.view(-1,
+                                                    inputs_embeds.shape[-1])
+        else:
+            # Flattened input - infer from mm_positions_by_request
+            max_batch_idx = max(mm_positions_by_request.keys()
+                                ) if mm_positions_by_request else 0
+            batch_size = max_batch_idx + 1
+            seq_len = total_tokens // batch_size
+            inputs_embeds_flat = inputs_embeds
+
+        # Create efficient mask from mm_positions
+        mask = create_multimodal_positions_mask(
+            batch_size=batch_size,
+            seq_len=seq_len,
+            mm_positions_by_request=mm_positions_by_request,
+            device=input_ids.device,
+        )
+
+        # Merge embeddings efficiently
+        inputs_embeds = _merge_multimodal_embeddings(
+            inputs_embeds_flat,
+            mask,
+            multimodal_embeddings,
+        )
+
+        # Reshape back if needed
+        if input_ids.dim() == 2:
+            inputs_embeds = inputs_embeds.view(batch_size, seq_len, -1)
+
+    return inputs_embeds
+
+
 def merge_multimodal_embeddings(
     input_ids: torch.Tensor,
     inputs_embeds: torch.Tensor,
@@ -505,6 +622,10 @@ def merge_multimodal_embeddings(
 
     Note:
         This updates ``inputs_embeds`` in place.
+        
+        For better performance when mm_positions are available from scheduled 
+        requests, consider using ``create_multimodal_positions_mask`` with
+        ``_merge_multimodal_embeddings`` directly.
     """
     if isinstance(placeholder_token_id, list):
         placeholder_token_id = torch.tensor(

@@ -1122,6 +1122,20 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                 [self.config.image_token_id, self.config.video_token_id])
         return inputs_embeds
 
+    def get_input_embeddings_with_mm_positions(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: Optional[MultiModalEmbeddings] = None,
+        mm_positions_by_request: Optional[dict[int, list]] = None,
+    ) -> torch.Tensor:
+        from .utils import get_input_embeddings_with_mm_positions
+        return get_input_embeddings_with_mm_positions(
+            input_ids=input_ids,
+            get_text_embeds=self.language_model.get_input_embeddings,
+            multimodal_embeddings=multimodal_embeddings,
+            mm_positions_by_request=mm_positions_by_request,
+        )
+
     def get_input_embeddings_v0(
         self,
         input_ids: torch.Tensor,

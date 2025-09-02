@@ -914,16 +914,70 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 mm_embeds.append(encoder_output)
         return mm_embeds
 
+    def _extract_mm_positions_by_request(
+            self, scheduler_output: "SchedulerOutput") -> dict[int, list]:
+        """
+        Extract mm_positions organized by batch index from existing scheduler data.
+        This avoids needing a separate field in SchedulerOutput.
+        """
+        mm_positions_by_request: dict[int, list] = {}
+
+        # Get the request order from input batch
+        req_ids = self.input_batch.req_ids
+
+        # Create mapping from req_id to mm_positions from new requests
+        new_req_mm_positions = {}
+        for new_req_data in scheduler_output.scheduled_new_reqs:
+            if new_req_data.mm_positions:
+                new_req_mm_positions[
+                    new_req_data.req_id] = new_req_data.mm_positions
+
+        # Map requests to batch indices in the order they appear in req_ids
+        batch_index = 0
+        for req_id in req_ids:
+            mm_positions = None
+
+            # Check if it's a new request
+            if req_id in new_req_mm_positions:
+                mm_positions = new_req_mm_positions[req_id]
+            # Check if it's a cached request in self.requests
+            elif req_id in self.requests:
+                cached_state = self.requests[req_id]
+                if cached_state.mm_positions:
+                    mm_positions = cached_state.mm_positions
+
+            if mm_positions:
+                mm_positions_by_request[batch_index] = mm_positions
+
+            batch_index += 1
+
+        return mm_positions_by_request
+
     def _get_model_inputs(self, input_ids: torch.Tensor,
                           mm_embeds: list[torch.Tensor]):
         if self.supports_mm_inputs:
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            inputs_embeds = self.model.get_input_embeddings(
-                input_ids=input_ids,
-                multimodal_embeddings=mm_embeds,
-            )
+
+            # Try efficient mm_positions-based embedding merge first
+            mm_positions_by_request = (self._extract_mm_positions_by_request(
+                self._current_scheduler_output) if hasattr(
+                    self, '_current_scheduler_output') else {})
+            if (mm_positions_by_request and mm_embeds and hasattr(
+                    self.model, 'get_input_embeddings_with_mm_positions')):
+                # Use efficient approach with mm_positions
+                inputs_embeds = self.model.get_input_embeddings_with_mm_positions(
+                    input_ids=input_ids,
+                    multimodal_embeddings=mm_embeds,
+                    mm_positions_by_request=mm_positions_by_request,
+                )
+            else:
+                # Fallback to current implementation
+                inputs_embeds = self.model.get_input_embeddings(
+                    input_ids=input_ids,
+                    multimodal_embeddings=mm_embeds,
+                )
             return None, inputs_embeds
         else:
             # For text-only models, we use token ids as input.
@@ -938,6 +992,8 @@ class TPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> ModelRunnerOutput:
+        # Store scheduler output for mm_positions access
+        self._current_scheduler_output = scheduler_output
         # Update cached state
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
