@@ -75,6 +75,7 @@ from .utils import (AutoWeightsLoader, WeightsMapper, cast_overflow_tensors,
                     init_vllm_registered_model, maybe_prefix,
                     merge_multimodal_embeddings)
 from .vision import get_vit_attn_backend
+from vllm.compilation.decorators import support_torch_compile
 
 logger = init_logger(__name__)
 
@@ -568,16 +569,21 @@ class Qwen2_5_VisionRotaryEmbedding(nn.Module):
         self.update_freqs_cache(seqlen)
         return self._freqs_cached[:seqlen]
 
-
+@support_torch_compile(
+    dynamic_arg_dims={
+        "x": 0,
+    })
 class Qwen2_5_VisionTransformer(nn.Module):
 
     def __init__(
         self,
+        *,
         vision_config: Qwen2_5_VLVisionConfig,
         norm_eps: float = 1e-6,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         use_data_parallel: bool = False,
+        vllm_config: Optional[VllmConfig] = None,
     ) -> None:
         super().__init__()
 
@@ -888,6 +894,13 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
     Qwen2_5_VLMultiModalProcessor,
     info=Qwen2_5_VLProcessingInfo,
     dummy_inputs=Qwen2_5_VLDummyInputsBuilder)
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": -1,
+        "intermediate_tensors": 0,
+        "inputs_embeds": 0,
+    })
 class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
                                          SupportsLoRA, SupportsPP,
                                          SupportsQuant):
@@ -931,12 +944,13 @@ class Qwen2_5_VLForConditionalGeneration(nn.Module, SupportsMultiModal,
         if multimodal_config.get_limit_per_prompt("image") or \
             multimodal_config.get_limit_per_prompt("video"):
             self.visual = Qwen2_5_VisionTransformer(
-                config.vision_config,
+                vision_config=config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=self._maybe_ignore_quant_config(
                     self.quant_config),
                 prefix=maybe_prefix(prefix, "visual"),
                 use_data_parallel=self.use_data_parallel,
+                vllm_config=vllm_config,
             )
         else:
             self.visual = None
