@@ -378,6 +378,26 @@ def run_whisper(question: str, audio_count: int) -> ModelRequestData:
     )
 
 
+# Step Audio 2
+def run_step_audio_2(question: str, audio_count: int) -> ModelRequestData:
+    model_name = "stepfun-ai/Step-Audio-2-mini"
+    engine_args = EngineArgs(
+        model=model_name,
+        max_model_len=4096,
+        max_num_seqs=5,
+        trust_remote_code=True,
+        limit_mm_per_prompt={"audio": audio_count},
+    )
+
+    # Step-Audio-2 uses <audio_patch> as audio placeholder
+    audio_placeholders = "<audio_patch>" * audio_count
+
+    # Step-Audio-2 uses <|BOT|> and <|EOT|> for chat formatting
+    prompt = f"<|BOT|>human\n{audio_placeholders}{question}<|EOT|><|BOT|>assistant\n"
+
+    return ModelRequestData(engine_args=engine_args, prompt=prompt)
+
+
 model_example_map = {
     "voxtral": run_voxtral,
     "gemma3n": run_gemma3n,
@@ -390,6 +410,7 @@ model_example_map = {
     "qwen2_5_omni": run_qwen2_5_omni,
     "ultravox": run_ultravox,
     "whisper": run_whisper,
+    "step_audio_2": run_step_audio_2,
 }
 
 
