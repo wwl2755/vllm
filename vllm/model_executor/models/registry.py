@@ -261,6 +261,7 @@ _MULTIMODAL_MODELS = {
     "Qwen2_5OmniForConditionalGeneration": ("qwen2_5_omni_thinker", "Qwen2_5OmniThinkerForConditionalGeneration"),  # noqa: E501
     "UltravoxModel": ("ultravox", "UltravoxModel"),
     "SkyworkR1VChatModel": ("skyworkr1v", "SkyworkR1VChatModel"),
+    "StepAudio2ForCausalLM": ("step_audio_2", "StepAudio2ForCausalLM"), # noqa: E501
     "Step3VLForConditionalGeneration": ("step3_vl", "Step3VLForConditionalGeneration"),  # noqa: E501
     "TarsierForConditionalGeneration": ("tarsier", "TarsierForConditionalGeneration"),  # noqa: E501
     "Tarsier2ForConditionalGeneration": ("qwen2_vl", "Tarsier2ForConditionalGeneration"),  # noqa: E501

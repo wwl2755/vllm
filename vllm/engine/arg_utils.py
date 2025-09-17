@@ -370,6 +370,7 @@ class EngineArgs:
     quantization: Optional[QuantizationMethods] = ModelConfig.quantization
     enforce_eager: bool = ModelConfig.enforce_eager
     max_seq_len_to_capture: int = ModelConfig.max_seq_len_to_capture
+    audio_parser: Optional[str] = ModelConfig.audio_parser
     disable_custom_all_reduce: bool = ParallelConfig.disable_custom_all_reduce
     limit_mm_per_prompt: dict[str, int] = \
         get_field(MultiModalConfig, "limit_per_prompt")
@@ -597,6 +598,8 @@ class EngineArgs:
                                  **model_kwargs["logits_processors"])
         model_group.add_argument("--io-processor-plugin",
                                  **model_kwargs["io_processor_plugin"])
+        model_group.add_argument("--audio-parser",
+                                 **model_kwargs["audio_parser"])
 
         # Model loading arguments
         load_kwargs = get_kwargs(LoadConfig)
@@ -1037,6 +1040,7 @@ class EngineArgs:
             override_attention_dtype=self.override_attention_dtype,
             logits_processors=self.logits_processors,
             io_processor_plugin=self.io_processor_plugin,
+            audio_parser=self.audio_parser,
         )
 
     def validate_tensorizer_args(self):
