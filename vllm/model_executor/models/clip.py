@@ -10,6 +10,9 @@ import torch.nn as nn
 from transformers import CLIPVisionConfig
 
 from vllm.attention.layer import MultiHeadAttention
+from vllm.compilation.decorators import support_torch_compile
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.distributed import divide, get_tensor_model_parallel_world_size
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
@@ -20,6 +23,8 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.interfaces import SupportsQuant
 
 from .vision import VisionEncoderInfo, resolve_visual_encoder_outputs
+
+logger = init_logger(__name__)
 
 
 class CLIPEncoderInfo(VisionEncoderInfo[CLIPVisionConfig]):
@@ -45,9 +50,10 @@ class CLIPEncoderInfo(VisionEncoderInfo[CLIPVisionConfig]):
 
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/models/clip/modeling_clip.py#L164 # noqa
+
 class CLIPVisionEmbeddings(nn.Module):
 
-    def __init__(self, config: CLIPVisionConfig):
+    def __init__(self, config: CLIPVisionConfig, *, vllm_config: Optional[VllmConfig] = None, prefix: str = ""):
         super().__init__()
         self.config = config
         self.embed_dim = config.hidden_size
@@ -78,10 +84,13 @@ class CLIPVisionEmbeddings(nn.Module):
         target_dtype = self.patch_embedding.weight.dtype
         patch_embeds = self.patch_embedding(pixel_values.to(
             dtype=target_dtype))  # shape = [*, width, grid, grid]
+        
         patch_embeds = patch_embeds.flatten(2).transpose(1, 2)
 
         class_embeds = self.class_embedding.expand(batch_size, 1, -1)
+        
         embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
+        
         embeddings = embeddings + self.position_embedding(self.position_ids)
 
         return embeddings
@@ -269,13 +278,14 @@ class CLIPVisionTransformer(nn.Module):
         num_hidden_layers_override: Optional[int] = None,
         require_post_norm: Optional[bool] = None,
         prefix: str = "",
+        vllm_config: Optional[VllmConfig] = None,
     ) -> None:
         super().__init__()
 
         self.config = config
         embed_dim = config.hidden_size
 
-        self.embeddings = CLIPVisionEmbeddings(config)
+        self.embeddings = CLIPVisionEmbeddings(config=config, vllm_config=vllm_config, prefix=f"{prefix}.embeddings")
 
         # NOTE: This typo of "layrnorm" is not fixed on purpose to match
         # the original transformers code and name of the model weights.
@@ -329,7 +339,7 @@ class CLIPVisionTransformer(nn.Module):
 
         return encoder_outputs
 
-
+@support_torch_compile(dynamic_arg_dims={"pixel_values": 0})
 class CLIPVisionModel(nn.Module, SupportsQuant):
     config_class = CLIPVisionConfig
     main_input_name = "pixel_values"
@@ -343,6 +353,7 @@ class CLIPVisionModel(nn.Module, SupportsQuant):
         num_hidden_layers_override: Optional[int] = None,
         require_post_norm: Optional[bool] = None,
         prefix: str = "",
+        vllm_config: Optional[VllmConfig] = None,
     ) -> None:
         super().__init__()
         self.vision_model = CLIPVisionTransformer(
@@ -350,7 +361,8 @@ class CLIPVisionModel(nn.Module, SupportsQuant):
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers_override,
             require_post_norm=require_post_norm,
-            prefix=f"{prefix}.vision_model")
+            prefix=f"{prefix}.vision_model",
+            vllm_config=vllm_config)
 
     def forward(
         self,

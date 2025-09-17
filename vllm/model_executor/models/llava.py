@@ -14,8 +14,11 @@ from transformers import (BatchFeature, CLIPVisionConfig, LlavaConfig,
 from transformers.models.llava import LlavaProcessor
 from transformers.models.pixtral import PixtralProcessor
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
+from vllm.forward_context import set_forward_context
 from vllm.inputs import InputProcessingContext
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.linear import (ColumnParallelLinear,
                                                RowParallelLinear)
@@ -43,6 +46,8 @@ from .utils import (AutoWeightsLoader, WeightsMapper, flatten_bn,
                     init_vllm_registered_model, maybe_prefix,
                     merge_multimodal_embeddings)
 from .vision import get_vision_encoder_info
+
+logger = init_logger(__name__)
 
 
 class LlavaImagePixelInputs(TensorSchema):
@@ -92,6 +97,7 @@ LlavaImageInputs = Union[LlavaImagePixelInputs, PixtralHFImagePixelInputs,
                          LlavaImageEmbeddingInputs]
 
 
+# @support_torch_compile(dynamic_arg_dims={"image_features": 0})
 class LlavaMultiModalProjector(nn.Module):
 
     def __init__(self,
@@ -100,7 +106,9 @@ class LlavaMultiModalProjector(nn.Module):
                  projector_hidden_act: str,
                  multimodal_projector_bias: bool,
                  quant_config: Optional[QuantizationConfig] = None,
-                 prefix: str = ""):
+                 prefix: str = "",
+                 *,
+                 vllm_config: Optional[VllmConfig] = None):
         super().__init__()
 
         self.linear_1 = ColumnParallelLinear(vision_hidden_size,
@@ -453,6 +461,7 @@ def init_vision_tower_for_llava(
     *,
     require_post_norm: Optional[bool] = None,
     prefix: str = "",
+    vllm_config: Optional[VllmConfig] = None,
 ) -> Union[CLIPVisionModel, SiglipVisionModel, PixtralHFVisionModel]:
     vision_config = hf_config.vision_config
 
@@ -461,11 +470,12 @@ def init_vision_tower_for_llava(
 
     if isinstance(vision_config, CLIPVisionConfig):
         return CLIPVisionModel(
-            vision_config,
+            config=vision_config,
             quant_config=quant_config,
             num_hidden_layers_override=num_hidden_layers,
             require_post_norm=require_post_norm,
             prefix=prefix,
+            vllm_config=vllm_config,
         )
     elif isinstance(vision_config, SiglipVisionConfig):
         return SiglipVisionModel(
@@ -516,6 +526,7 @@ class LlavaForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
+        self.vllm_config = vllm_config
 
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -533,32 +544,42 @@ class LlavaForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
                 and config.vision_config.hidden_act == "gelu"):
             config.projector_hidden_act = "gelu"
 
+        from vllm.compilation.backends import set_model_tag
+
         # TODO: Optionally initializes this for supporting embeddings.
         if multimodal_config.get_limit_per_prompt("image"):
-            self.vision_tower = init_vision_tower_for_llava(
-                config,
-                quant_config,
-                require_post_norm=False,
-                prefix=maybe_prefix(prefix, "vision_tower"))
-            self.multi_modal_projector = LlavaMultiModalProjector(
-                vision_hidden_size=config.vision_config.hidden_size,
-                text_hidden_size=config.text_config.hidden_size,
-                projector_hidden_act=config.projector_hidden_act,
-                multimodal_projector_bias=config.multimodal_projector_bias,
-                quant_config=quant_config,
-                prefix=maybe_prefix(prefix, "multi_modal_projector"))
+            with set_model_tag("vision_tower"):
+                self.vision_tower = init_vision_tower_for_llava(
+                    config,
+                    quant_config,
+                    require_post_norm=False,
+                    prefix=maybe_prefix(prefix, "vision_tower"),
+                    vllm_config=vllm_config)
+
+            with set_model_tag("multi_modal_projector"):
+                self.multi_modal_projector = LlavaMultiModalProjector(
+                    vision_hidden_size=config.vision_config.hidden_size,
+                    text_hidden_size=config.text_config.hidden_size,
+                    projector_hidden_act=config.projector_hidden_act,
+                    multimodal_projector_bias=config.multimodal_projector_bias,
+                    quant_config=quant_config,
+                    prefix=maybe_prefix(prefix, "multi_modal_projector"),
+                    vllm_config=vllm_config)
         else:
             self.vision_tower = None
             self.multi_modal_projector = None
 
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            hf_config=config.text_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-        )
+        with set_model_tag("language_model"):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                hf_config=config.text_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors)
+        
+
 
     def _parse_and_validate_image_input(
             self, **kwargs: object) -> Optional[LlavaImageInputs]:
@@ -572,6 +593,13 @@ class LlavaForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
             if not isinstance(pixel_values, (torch.Tensor, list)):
                 raise ValueError("Incorrect type of pixel values. "
                                  f"Got type: {type(pixel_values)}")
+
+            # Log input shapes for torch.compile investigation
+            # if isinstance(pixel_values, torch.Tensor):
+            #     logger.info(f"[LLaVA ViT Shape] Input pixel_values shape: {pixel_values.shape}")
+            # elif isinstance(pixel_values, list) and len(pixel_values) > 0:
+            #     if isinstance(pixel_values[0], torch.Tensor):
+            #         logger.info(f"[LLaVA ViT Shape] Input pixel_values list with {len(pixel_values)} tensors, first shape: {pixel_values[0].shape}")
 
             if self.config.vision_config.model_type == "pixtral":
                 return PixtralHFImagePixelInputs(
@@ -620,9 +648,24 @@ class LlavaForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
                             PixtralHFVisionModel],
         pixel_values: Union[torch.Tensor, list[torch.Tensor]],
     ) -> Union[torch.Tensor, tuple[torch.Tensor, ...]]:
+        # # Log shapes before vision tower
+        # if isinstance(pixel_values, torch.Tensor):
+        #     logger.info(f"[LLaVA ViT Shape] Before vision tower: {pixel_values.shape}")
+        # elif isinstance(pixel_values, list) and len(pixel_values) > 0:
+        #     logger.info(f"[LLaVA ViT Shape] Before vision tower: list of {len(pixel_values)} tensors, first shape: {pixel_values[0].shape}")
+
         # NOTE: we skip the step to select the vision feature layer since
         # this is already done inside the vision tower
-        image_features = vision_tower(pixel_values)
+        with set_forward_context(None, self.vllm_config):
+            image_features = vision_tower(pixel_values)
+
+        # # Log shapes after vision tower
+        # if isinstance(image_features, torch.Tensor):
+        #     logger.info(f"[LLaVA ViT Shape] After vision tower: {image_features.shape}")
+        # elif isinstance(image_features, tuple) and len(image_features) > 0:
+        #     logger.info(f"[LLaVA ViT Shape] After vision tower: tuple of {len(image_features)} tensors, first shape: {image_features[0].shape}")
+        
+        # logger.info(f"[LLaVA ViT Shape] Vision feature select strategy: {self.config.vision_feature_select_strategy}")
 
         def select_features(leaf: torch.Tensor):
             return self._select_image_features(
@@ -656,13 +699,20 @@ class LlavaForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP):
         image_features = self._process_image_pixels(image_input)
 
         if isinstance(image_features, torch.Tensor):
-            return self.multi_modal_projector(image_features)
+            # logger.info(f"[LLaVA ViT Shape] Before multi_modal_projector: {image_features.shape}")
+            with set_forward_context(None, self.vllm_config):
+                projected_features = self.multi_modal_projector(image_features)
+            # logger.info(f"[LLaVA ViT Shape] After multi_modal_projector: {projected_features.shape}")
+            return projected_features
 
         feature_sizes = [
             image_feature.shape[0] for image_feature in image_features
         ]
+        # logger.info(f"[LLaVA ViT Shape] Before multi_modal_projector (concat): feature_sizes={feature_sizes}, total_shape={torch.cat(image_features).shape}")
 
-        image_embeds = self.multi_modal_projector(torch.cat(image_features))
+        with set_forward_context(None, self.vllm_config):
+            image_embeds = self.multi_modal_projector(torch.cat(image_features))
+        # logger.info(f"[LLaVA ViT Shape] After multi_modal_projector (concat): {image_embeds.shape}")
         image_embeds = torch.split(image_embeds, feature_sizes)
         return image_embeds
 
